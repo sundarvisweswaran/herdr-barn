@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""herdr-barn: a chat room for your herd of coding agents.
+
+    barn ui                 open the room (curses); Tab completes @mentions
+    barn say "@devbox/w1:p2 run the tests"
+    barn log [-n 30]        recent history, plain text
+    barn who                agents the router can see
+    barn router [--daemon]  deliver @mentions (runs on the hub, i.e. your Mac)
+
+The hub keeps the log in ~/.herdr-barn/barn.jsonl. Every host (hub and boxes)
+has ~/.herdr-barn/outbox.jsonl: `barn say` appends there, the router tails each
+outbox over SSH, and mirrors the log back so `barn log` works on the boxes.
+Messages to an agent wait until it is idle/done, then go in through
+`herdr agent prompt`. The human is @human; agents are @<box>/<pane-id> or a
+herdr agent name.
+
+Extending: every executable in ~/.herdr-barn/hooks/ receives each message and
+system event as one JSON line on stdin.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import io
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import unicodedata
+import uuid
+from collections import deque
+from datetime import datetime
+
+BARN_DIR = os.path.expanduser(os.environ.get("BARN_DIR", "~/.herdr-barn"))
+OUTBOX = os.path.join(BARN_DIR, "outbox.jsonl")
+LOG = os.path.join(BARN_DIR, "barn.jsonl")
+LOCK = os.path.join(BARN_DIR, "router.lock")
+ROUTER_LOG = os.path.join(BARN_DIR, "router.log")
+HOOKS_DIR = os.path.join(BARN_DIR, "hooks")
+# Only the machine with this marker runs the router. The plugin is installed on
+# every box so the room opens wherever you are focused; boxes are viewers.
+HUB_MARKER = os.path.join(BARN_DIR, "hub")
+PLUGIN_FILES = ("barn", "herdr-plugin.toml")
+REMOTE_PLUGIN_DIR = "~/.herdr-barn/plugin"
+HERDR = (
+    os.environ.get("HERDR_BIN_PATH")
+    or shutil.which("herdr")
+    or os.path.expanduser("~/.local/bin/herdr")
+)
+HUMAN = "human"
+LOCAL = "local"
+MAX_HOPS = int(os.environ.get("BARN_MAX_HOPS", "8"))
+RATE_N, RATE_WINDOW = 12, 600  # agent-originated deliveries per sender
+KEEP_LINES = 3000
+REMOTE_BIN = "~/.local/bin/barn"
+SSH_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=3",
+]
+
+# @human, @all, @w1:p2, @devbox/w1:p2, @reviewer, @buildbox/reviewer
+MENTION = re.compile(
+    r"(?<![\w@/])@(?:([A-Za-z0-9][A-Za-z0-9_.-]*)/)?"
+    r"([A-Za-z0-9](?:[A-Za-z0-9_:.-]*[A-Za-z0-9])?)"
+)
+STATE_GLYPH = {"working": "◐", "idle": "○", "done": "●", "blocked": "▲", "unknown": "?"}
+DELIVERY_GLYPH = {"queued": "…", "delivered": "✓", "held": "⏸", "dropped": "✗"}
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def hhmm(ts: str) -> str:
+    try:
+        return datetime.fromisoformat(ts).astimezone().strftime("%H:%M")
+    except (TypeError, ValueError):
+        return "--:--"
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def append_jsonl(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def parse_line(line: str):
+    try:
+        obj = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def read_jsonl(path: str) -> list:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [o for o in (parse_line(l) for l in fh) if o]
+    except FileNotFoundError:
+        return []
+
+
+def router_running() -> bool:
+    os.makedirs(BARN_DIR, exist_ok=True)
+    with open(LOCK, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        return False
+
+
+def spawn_router() -> None:
+    os.makedirs(BARN_DIR, exist_ok=True)
+    with open(ROUTER_LOG, "a") as out:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "router"],
+            stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+            start_new_session=True,
+        )
+
+
+def display_addr(addr: str, roster: dict) -> str:
+    if addr == HUMAN:
+        return "@human"
+    agent = roster.get(addr)
+    if agent and agent.get("name"):
+        return f"{agent['name']}@{agent['box']}"
+    return addr
+
+
+# ───────────────────────────── say / log / who ──────────────────────────────
+
+
+def cmd_say(args) -> int:
+    text = sys.stdin.read() if args.text == ["-"] else " ".join(args.text)
+    text = text.strip()
+    if not text:
+        print("barn: nothing to say", file=sys.stderr)
+        return 2
+    sender = HUMAN if args.human else (os.environ.get("HERDR_PANE_ID") or HUMAN)
+    append_jsonl(OUTBOX, {"id": new_id(), "ts": now_iso(), "from": sender, "text": text})
+    print("posted to the barn")
+    return 0
+
+
+def latest_roster(entries: list) -> dict:
+    for obj in reversed(entries):
+        if obj.get("kind") == "roster":
+            return {a["addr"]: a for a in obj.get("agents", [])}
+    return {}
+
+
+def cmd_log(args) -> int:
+    entries = read_jsonl(LOG)
+    roster = latest_roster(entries)
+    shown = [o for o in entries if o.get("kind") in ("msg", "sys")][-args.n:]
+    for obj in shown:
+        if obj["kind"] == "sys":
+            print(f"{hhmm(obj.get('ts'))} · {obj.get('text', '')}")
+        else:
+            who = display_addr(obj.get("from", "?"), roster)
+            print(f"{hhmm(obj.get('ts'))} {who}: {obj.get('text', '')}")
+    if not shown:
+        print("(the barn is quiet)")
+    return 0
+
+
+def cmd_who(args) -> int:
+    roster = latest_roster(read_jsonl(LOG))
+    if not roster:
+        print("(no agents seen yet; is the router running on the hub?)")
+    for addr, a in roster.items():
+        glyph = STATE_GLYPH.get(a.get("status"), "?")
+        name = f" ({a['name']})" if a.get("name") else ""
+        print(f"{glyph} @{addr}{name}  {a.get('kind') or ''}  {a.get('title') or ''}".rstrip())
+    return 0
+
+
+# ───────────────────────────────── router ───────────────────────────────────
+
+
+def rlog(msg: str) -> None:
+    print(f"{now_iso()} {msg}", flush=True)
+
+
+def herdr_error(proc) -> tuple:
+    """(code, message) from a failed herdr CLI call."""
+    raw = (proc.stderr or proc.stdout or "").strip()
+    obj = parse_line(raw.splitlines()[-1]) if raw else None
+    err = (obj or {}).get("error") or {}
+    return err.get("code") or "", err.get("message") or raw[:200]
+
+
+class Box:
+    """One herdr server: the hub itself (target None) or a saved SSH machine."""
+
+    def __init__(self, router: "Router", label: str, target):
+        self.router, self.label, self.target = router, label, target
+        self.alive = True
+        self.online = False
+        self.mirror_q: queue.Queue = queue.Queue()
+        self.procs: list = []
+        threads = [self.inbound, self.roster_loop]
+        if target:
+            threads.append(self.mirror)
+        for fn in threads:
+            threading.Thread(target=fn, daemon=True, name=f"{label}:{fn.__name__}").start()
+
+    def stop(self) -> None:
+        self.alive = False
+        for proc in self.procs:
+            if proc.poll() is None:
+                proc.kill()
+
+    def herdr(self, *args, timeout=30):
+        cmd = [HERDR] + (["--machine", self.label] if self.target else []) + list(args)
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(cmd, 124, "", '{"error":{"code":"timeout"}}')
+
+    def ssh(self, remote_cmd: str) -> list:
+        return ["ssh"] + SSH_OPTS + [self.target, remote_cmd]
+
+    def deploy(self) -> None:
+        """Keep the box's copy of the plugin identical to the hub's."""
+        root = os.path.dirname(os.path.realpath(__file__))
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            for name in PLUGIN_FILES:
+                path = os.path.join(root, name)
+                if os.path.exists(path):
+                    tar.add(path, arcname=name)
+        cmd = self.ssh(
+            f"mkdir -p ~/.local/bin {REMOTE_PLUGIN_DIR} && tar -C {REMOTE_PLUGIN_DIR} -xf - && "
+            f"ln -sf {REMOTE_PLUGIN_DIR}/barn ~/.local/bin/barn"
+        )
+        try:
+            subprocess.run(cmd, input=archive.getvalue(), capture_output=True, timeout=30, check=True)
+        except (subprocess.SubprocessError, OSError) as exc:
+            rlog(f"{self.label}: deploy failed: {exc}")
+
+    def inbound(self) -> None:
+        backoff = 2
+        while self.alive:
+            if self.target:
+                self.deploy()
+                cmd = self.ssh(
+                    "mkdir -p ~/.herdr-barn && touch ~/.herdr-barn/outbox.jsonl && "
+                    "exec tail -n +1 -F ~/.herdr-barn/outbox.jsonl"
+                )
+            else:
+                os.makedirs(BARN_DIR, exist_ok=True)
+                open(OUTBOX, "a").close()
+                cmd = ["tail", "-n", "+1", "-F", OUTBOX]
+            started = time.time()
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, text=True, bufsize=1)
+            self.procs.append(proc)
+            for line in proc.stdout:
+                self.router.events.put((self.label, line))
+            proc.wait()
+            self.procs.remove(proc)
+            if not self.alive:
+                return
+            backoff = 2 if time.time() - started > 60 else min(backoff * 2, 60)
+            rlog(f"{self.label}: outbox stream ended (exit {proc.returncode}); retry in {backoff}s")
+            time.sleep(backoff)
+
+    def mirror(self) -> None:
+        while self.alive:
+            proc = subprocess.Popen(
+                self.ssh("mkdir -p ~/.herdr-barn && cat > ~/.herdr-barn/barn.jsonl"),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.procs.append(proc)
+            try:
+                with self.router.lock:  # snapshot + queue drain are atomic with post()
+                    snapshot = self.router.snapshot_bytes()
+                    while not self.mirror_q.empty():
+                        self.mirror_q.get_nowait()
+                proc.stdin.write(snapshot)
+                proc.stdin.flush()
+                while self.alive:
+                    try:
+                        data = self.mirror_q.get(timeout=30)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                self.procs.remove(proc)
+            if self.alive:
+                time.sleep(10)
+
+    def roster_loop(self) -> None:
+        while self.alive:
+            proc = self.herdr("agent", "list", timeout=20)
+            obj = parse_line(proc.stdout) if proc.returncode == 0 else None
+            if obj is not None:
+                self.online = True
+                agents = []
+                for a in (obj.get("result") or {}).get("agents") or []:
+                    pane = a.get("pane_id")
+                    if not pane:
+                        continue
+                    agents.append({
+                        "addr": f"{self.label}/{pane}",
+                        "box": self.label,
+                        "pane": pane,
+                        "name": a.get("name"),
+                        "kind": a.get("agent"),
+                        "status": a.get("agent_status"),
+                        "title": a.get("terminal_title_stripped") or "",
+                    })
+                self.router.set_agents(self.label, agents)
+            elif self.online:
+                self.online = False
+                self.router.set_agents(self.label, [])
+            time.sleep(4)
+
+
+class Worker(threading.Thread):
+    """Serialises delivery to one agent; waits until it is ready for input."""
+
+    def __init__(self, router: "Router", agent: dict):
+        super().__init__(daemon=True, name=f"deliver:{agent['addr']}")
+        self.router, self.addr, self.pane = router, agent["addr"], agent["pane"]
+        self.box_label = agent["box"]
+        self.q: queue.Queue = queue.Queue()
+        self.start()
+
+    def enqueue(self, msg: dict) -> None:
+        self.q.put(msg)
+
+    def drain(self, batch: list) -> None:
+        while True:
+            try:
+                batch.append(self.q.get_nowait())
+            except queue.Empty:
+                return
+
+    def run(self) -> None:
+        while True:
+            batch = [self.q.get()]
+            try:
+                self.deliver(batch)
+            except Exception as exc:  # keep the worker alive for later messages
+                rlog(f"{self.addr}: delivery crashed: {exc!r}")
+                self.finish(batch, "dropped", f"delivery to @{self.addr} failed: {exc}")
+
+    def finish(self, batch: list, state: str, note=None) -> None:
+        for msg in batch:
+            self.router.status(msg["id"], self.addr, state)
+        if note:
+            self.router.sys(note, ref=batch[-1]["id"])
+
+    def agent_status(self):
+        box = self.router.boxes.get(self.box_label)
+        if box is None:
+            return None, "box_removed"
+        proc = box.herdr("agent", "get", self.pane)
+        if proc.returncode == 0:
+            agent = ((parse_line(proc.stdout) or {}).get("result") or {}).get("agent") or {}
+            return agent.get("agent_status") or "unknown", ""
+        return None, herdr_error(proc)[0] or "error"
+
+    def compose(self, batch: list) -> str:
+        roster = self.router.roster_by_addr()
+        lines = [f"[barn] {display_addr(m['from'], roster)}: {m['text']}" for m in batch]
+        lines.append(
+            f"(herdr-barn: you are @{self.addr}. Reply with: {REMOTE_BIN} say \"@human ...\""
+            f" (or @<box>/<pane> for another agent). History: {REMOTE_BIN} log)"
+        )
+        return "\n".join(lines)
+
+    def deliver(self, batch: list) -> None:
+        held = False
+        blocked_since = None
+        failures = 0
+        while True:
+            self.drain(batch)
+            status, err = self.agent_status()
+            if status is None:
+                if err.endswith("not_found") or err == "box_removed":
+                    return self.finish(batch, "dropped",
+                                       f"@{self.addr} left the barn; dropped {len(batch)} message(s)")
+                failures += 1
+                if failures >= 30:
+                    return self.finish(batch, "dropped", f"@{self.addr} unreachable ({err}); dropped")
+                time.sleep(10)
+                continue
+            failures = 0
+            if status == "blocked":
+                # herdr can flag a screen as blocked for a moment; only a block that
+                # persists is worth telling @human about
+                blocked_since = blocked_since or time.time()
+                if not held and time.time() - blocked_since >= 8:
+                    held = True
+                    self.finish(batch, "held",
+                                f"@{self.addr} is waiting on an approval; holding "
+                                f"{len(batch)} message(s) until @human answers it")
+                time.sleep(4)
+                continue
+            blocked_since = None
+            if status == "working":
+                box = self.router.boxes[self.box_label]
+                box.herdr("agent", "wait", self.pane, "--until", "idle", "--until", "done",
+                          "--until", "blocked", "--timeout", "300000", timeout=310)
+                continue
+            box = self.router.boxes[self.box_label]
+            proc = box.herdr("agent", "prompt", self.pane, self.compose(batch), timeout=60)
+            if proc.returncode == 0:
+                self.router.delivered(self.addr, batch)
+                return self.finish(batch, "delivered")
+            code, message = herdr_error(proc)
+            if code == "agent_blocked":
+                continue
+            if code.endswith("not_found"):
+                return self.finish(batch, "dropped", f"@{self.addr} left the barn; dropped")
+            return self.finish(batch, "dropped", f"delivery to @{self.addr} failed: {code or message}")
+
+
+class Router:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.events: queue.Queue = queue.Queue()
+        self.boxes: dict = {}
+        self.agents: dict = {}  # box label -> [agent]
+        self.workers: dict = {}
+        self.inherited: dict = {}  # addr -> hop count of what it was last told
+        self.rate: dict = {}
+        self.roster_key = None
+        self.roster_at = 0.0
+        self.compact()
+        self.seen = {o["id"] for o in read_jsonl(LOG) if o.get("kind") == "msg" and o.get("id")}
+
+    # log ------------------------------------------------------------------
+    def compact(self) -> None:
+        entries = read_jsonl(LOG)
+        if len(entries) <= KEEP_LINES * 2:
+            return
+        roster = [o for o in entries if o.get("kind") == "roster"][-1:]
+        kept = [o for o in entries if o.get("kind") != "roster"][-KEEP_LINES:]
+        tmp = LOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for obj in kept + roster:
+                fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        os.replace(tmp, LOG)
+
+    def snapshot_bytes(self) -> bytes:
+        try:
+            with open(LOG, "rb") as fh:
+                lines = fh.readlines()
+        except FileNotFoundError:
+            return b""
+        return b"".join(lines[-KEEP_LINES:])
+
+    def post(self, obj: dict) -> None:
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+        with self.lock:
+            append_jsonl(LOG, obj)
+            for box in self.boxes.values():
+                if box.target:
+                    box.mirror_q.put(data)
+        if obj.get("kind") in ("msg", "sys"):
+            self.run_hooks(data)
+
+    def run_hooks(self, data: bytes) -> None:
+        try:
+            hooks = sorted(os.listdir(HOOKS_DIR))
+        except FileNotFoundError:
+            return
+        for name in hooks:
+            path = os.path.join(HOOKS_DIR, name)
+            if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                continue
+            try:
+                proc = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, start_new_session=True)
+                proc.stdin.write(data)
+                proc.stdin.close()
+                threading.Thread(target=proc.wait, daemon=True).start()
+            except OSError as exc:
+                rlog(f"hook {name}: {exc}")
+
+    def sys(self, text: str, ref=None) -> None:
+        self.post({"kind": "sys", "id": new_id(), "ts": now_iso(), "text": text, "ref": ref})
+
+    def status(self, ref: str, addr: str, state: str) -> None:
+        self.post({"kind": "status", "ts": now_iso(), "ref": ref, "to": addr, "state": state})
+
+    # roster ---------------------------------------------------------------
+    def set_agents(self, label: str, agents: list) -> None:
+        with self.lock:
+            self.agents[label] = agents
+            everyone = [a for box in self.boxes for a in self.agents.get(box, [])]
+            key = tuple((a["addr"], a["name"], a["status"], a["title"]) for a in everyone)
+            if key == self.roster_key:
+                return
+            # titles tick constantly (spinners); only let them alone re-post once a minute
+            identity = tuple(k[:3] for k in key)
+            old_identity = tuple(k[:3] for k in (self.roster_key or ()))
+            if identity == old_identity and time.time() - self.roster_at < 60:
+                return
+            self.roster_key, self.roster_at = key, time.time()
+            online = {l: b.online for l, b in self.boxes.items()}
+        self.post({"kind": "roster", "ts": now_iso(), "boxes": online, "agents": everyone})
+
+    def roster_by_addr(self) -> dict:
+        with self.lock:
+            return {a["addr"]: a for agents in self.agents.values() for a in agents}
+
+    # routing --------------------------------------------------------------
+    def sender_addr(self, box: str, raw) -> str:
+        if not raw or raw == HUMAN:
+            return HUMAN
+        return f"{box}/{raw}"
+
+    def resolve(self, text: str, box: str, sender: str):
+        roster = self.roster_by_addr()
+        targets, notes, human = {}, [], False
+        for m in MENTION.finditer(text):
+            box_part, ident = m.group(1), m.group(2)
+            if ident.lower() == HUMAN and not box_part:
+                human = True
+                continue
+            if ident == "all" and not box_part:
+                if sender != HUMAN:
+                    notes.append("only @human can use @all")
+                    continue
+                targets.update({a["addr"]: a for a in roster.values()})
+                continue
+            if box_part and box_part not in self.boxes:
+                notes.append(f"no box called {box_part!r} (boxes: {', '.join(self.boxes)})")
+                continue
+            cands = [a for a in roster.values()
+                     if (not box_part or a["box"] == box_part)
+                     and ident in (a["pane"], a["name"])]
+            if len(cands) > 1:
+                same_box = [a for a in cands if a["box"] == box]
+                cands = same_box if len(same_box) == 1 else cands
+            if not cands:
+                notes.append(f"no agent @{m.group(0)[1:]} in the barn")
+            elif len(cands) > 1:
+                notes.append(f"@{ident} is ambiguous: " + ", ".join("@" + a["addr"] for a in cands))
+            else:
+                targets[cands[0]["addr"]] = cands[0]
+        targets.pop(sender, None)
+        return list(targets.values()), notes, human
+
+    def rate_ok(self, sender: str) -> bool:
+        stamps = self.rate.setdefault(sender, deque())
+        cutoff = time.time() - RATE_WINDOW
+        while stamps and stamps[0] < cutoff:
+            stamps.popleft()
+        if len(stamps) >= RATE_N:
+            return False
+        stamps.append(time.time())
+        return True
+
+    def delivered(self, addr: str, batch: list) -> None:
+        with self.lock:
+            self.inherited[addr] = min(m["hops"] for m in batch)
+
+    def handle(self, box: str, line: str) -> None:
+        m = parse_line(line)
+        if not m:
+            return
+        mid, text = m.get("id"), str(m.get("text") or "").strip()
+        if not mid or not text or mid in self.seen:
+            return
+        self.seen.add(mid)
+        sender = self.sender_addr(box, m.get("from"))
+        with self.lock:
+            hops = 0 if sender == HUMAN else self.inherited.get(sender, 0) + 1
+        targets, notes, human = self.resolve(text, box, sender)
+        to = [a["addr"] for a in targets] + ([HUMAN] if human else [])
+        self.post({"kind": "msg", "id": mid, "ts": m.get("ts") or now_iso(), "from": sender,
+                   "box": box, "text": text, "to": to, "hops": hops})
+        for note in notes:
+            self.sys(note, ref=mid)
+        if not targets:
+            return
+        refusal = None
+        if sender != HUMAN and hops > MAX_HOPS:
+            refusal = f"hop limit ({MAX_HOPS}) reached; not delivering. @human, reply to keep it going"
+        elif sender != HUMAN and not self.rate_ok(sender):
+            refusal = f"@{sender} is over {RATE_N} messages per {RATE_WINDOW // 60} min; not delivering"
+        for agent in targets:
+            if refusal:
+                self.status(mid, agent["addr"], "dropped")
+                continue
+            self.status(mid, agent["addr"], "queued")
+            worker = self.workers.get(agent["addr"])
+            if worker is None:
+                worker = self.workers[agent["addr"]] = Worker(self, agent)
+            worker.enqueue({"id": mid, "from": sender, "text": text, "hops": hops})
+        if refusal:
+            self.sys(refusal, ref=mid)
+
+    # machines -------------------------------------------------------------
+    def sync_boxes(self) -> None:
+        wanted = {LOCAL: None}
+        try:
+            proc = subprocess.run([HERDR, "machine", "list", "--json"], capture_output=True,
+                                  text=True, timeout=15, stdin=subprocess.DEVNULL)
+            for machine in json.loads(proc.stdout or "[]"):
+                if machine.get("enabled") and machine.get("label"):
+                    wanted[machine["label"]] = machine.get("target") or machine["label"]
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            rlog(f"machine list failed: {exc}")
+            return
+        for label in list(self.boxes):
+            if label not in wanted or self.boxes[label].target != wanted[label]:
+                rlog(f"{label}: leaving")
+                with self.lock:
+                    self.boxes.pop(label).stop()
+                    self.agents.pop(label, None)
+        for label, target in wanted.items():
+            if label not in self.boxes:
+                rlog(f"{label}: joining ({target or 'hub'})")
+                with self.lock:
+                    self.boxes[label] = Box(self, label, target)
+
+    def run(self) -> None:
+        rlog(f"router up (pid {os.getpid()}, herdr {HERDR})")
+        next_sync = 0.0
+        while True:
+            if time.time() >= next_sync:
+                self.sync_boxes()
+                next_sync = time.time() + 60
+            try:
+                box, line = self.events.get(timeout=5)
+            except queue.Empty:
+                continue
+            try:
+                self.handle(box, line)
+            except Exception as exc:
+                rlog(f"handle failed: {exc!r}")
+
+
+def cmd_router(args) -> int:
+    if not os.path.exists(HUB_MARKER):
+        if not args.daemon:
+            print(f"barn: not the hub; `touch {HUB_MARKER}` on the machine that should route",
+                  file=sys.stderr)
+        return 0
+    if args.daemon:
+        if not router_running():
+            spawn_router()
+        return 0
+    os.makedirs(BARN_DIR, exist_ok=True)
+    lock_fh = open(LOCK, "a")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("barn: router already running", file=sys.stderr)
+        return 0
+    router = Router()
+
+    def shutdown(signum, _frame):
+        rlog(f"router stopping (signal {signum})")
+        for box in list(router.boxes.values()):
+            box.stop()  # kill ssh tails and mirrors so nothing outlives the router
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    router.run()
+    return 0
+
+
+# ─────────────────────────────────── ui ─────────────────────────────────────
+
+
+def cell_width(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(s: str) -> int:
+    return sum(cell_width(c) for c in s)
+
+
+def wrap(text: str, width: int) -> list:
+    width = max(width, 8)
+    out = []
+    for para in text.split("\n"):
+        line, used = "", 0
+        for word in re.split(r"(\s+)", para):
+            w = text_width(word)
+            if used + w <= width:
+                line, used = line + word, used + w
+                continue
+            if line.strip():
+                out.append(line.rstrip())
+            word = word.lstrip() if word.isspace() else word
+            line, used = "", 0
+            while text_width(word) > width:  # hard-break very long tokens
+                cut, cw = "", 0
+                for ch in word:
+                    if cw + cell_width(ch) > width:
+                        break
+                    cut, cw = cut + ch, cw + cell_width(ch)
+                out.append(cut)
+                word = word[len(cut):]
+            line, used = word, text_width(word)
+        out.append(line.rstrip())
+    return out or [""]
+
+
+class UI:
+    def __init__(self, scr):
+        import curses
+
+        self.c = curses
+        self.scr = scr
+        self.entries: list = []
+        self.statuses: dict = {}
+        self.roster: dict = {}
+        self.boxes_online: dict = {}
+        self.offset = 0
+        self.partial = ""
+        self.buf: list = []
+        self.cur = 0
+        self.history: list = []
+        self.hist_i = 0
+        self.scroll = 0
+        self.flash = ""
+        self.flash_until = 0.0
+        self.comp = None
+        self.router_up = None
+        self.router_checked = 0.0
+        self.hub = os.path.exists(HUB_MARKER)
+        curses.curs_set(1)
+        scr.keypad(True)
+        scr.timeout(250)
+        curses.use_default_colors()
+        palette = [curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_YELLOW,
+                   curses.COLOR_MAGENTA, curses.COLOR_BLUE, curses.COLOR_RED]
+        for i, color in enumerate(palette, start=1):
+            curses.init_pair(i, color, -1)
+        self.HUMAN = curses.color_pair(1) | curses.A_BOLD
+        self.SYS = curses.color_pair(3) | curses.A_DIM
+        self.MENTION = curses.color_pair(4) | curses.A_BOLD
+        self.DIM = curses.A_DIM
+        self.agent_colors = [curses.color_pair(2) | curses.A_BOLD,
+                             curses.color_pair(5) | curses.A_BOLD,
+                             curses.color_pair(6) | curses.A_BOLD]
+
+    # data -----------------------------------------------------------------
+    def poll(self) -> bool:
+        try:
+            size = os.path.getsize(LOG)
+        except FileNotFoundError:
+            return False
+        if size < self.offset:  # mirror rewrote the file
+            self.entries, self.statuses, self.offset, self.partial = [], {}, 0, ""
+        if size == self.offset:
+            return False
+        with open(LOG, "rb") as fh:
+            fh.seek(self.offset)
+            chunk = fh.read()
+        self.offset += len(chunk)
+        text = self.partial + chunk.decode("utf-8", "replace")
+        lines = text.split("\n")
+        self.partial = lines.pop()
+        for line in lines:
+            obj = parse_line(line)
+            if not obj:
+                continue
+            kind = obj.get("kind")
+            if kind in ("msg", "sys"):
+                self.entries.append(obj)
+            elif kind == "status":
+                self.statuses.setdefault(obj.get("ref"), {})[obj.get("to")] = obj.get("state")
+            elif kind == "roster":
+                self.roster = {a["addr"]: a for a in obj.get("agents", [])}
+                self.boxes_online = obj.get("boxes") or {}
+        return True
+
+    def check_router(self) -> None:
+        if not self.hub or time.time() - self.router_checked < 2:
+            return
+        self.router_checked = time.time()
+        self.router_up = router_running()
+
+    # rendering ------------------------------------------------------------
+    def agent_attr(self, addr: str):
+        return self.agent_colors[sum(map(ord, addr)) % len(self.agent_colors)]
+
+    def segments(self, text: str, base):
+        """Split text into (chunk, attr) with @mentions highlighted."""
+        out, pos = [], 0
+        for m in MENTION.finditer(text):
+            if m.start() > pos:
+                out.append((text[pos:m.start()], base))
+            out.append((m.group(0), self.MENTION))
+            pos = m.end()
+        if pos < len(text):
+            out.append((text[pos:], base))
+        return out
+
+    def build_lines(self, width: int) -> list:
+        rows = []
+        for obj in self.entries:
+            ts = hhmm(obj.get("ts"))
+            if obj["kind"] == "sys":
+                for i, part in enumerate(wrap(obj.get("text", ""), width - 8)):
+                    rows.append([((ts if i == 0 else "     ") + " · ", self.SYS), (part, self.SYS)])
+                continue
+            sender = obj.get("from", "?")
+            who = display_addr(sender, self.roster)
+            attr = self.HUMAN if sender == HUMAN else self.agent_attr(sender)
+            head = f"{ts} "
+            body = wrap(obj.get("text", ""), width - 8)
+            rows.append([(head, self.DIM), (who, attr)])
+            for part in body:
+                rows.append([("      ", 0)] + self.segments(part, 0))
+            states = self.statuses.get(obj.get("id"), {})
+            targets = [t for t in obj.get("to", []) if t != HUMAN]
+            if targets:
+                marks = "  ".join(
+                    f"{display_addr(t, self.roster)} {DELIVERY_GLYPH.get(states.get(t), '·')}"
+                    for t in targets
+                )
+                rows.append([("      → " + marks, self.DIM)])
+        return rows
+
+    def put(self, y: int, x: int, text: str, attr=0, limit=None) -> int:
+        h, w = self.scr.getmaxyx()
+        limit = w - x if limit is None else min(limit, w - x)
+        out, used = "", 0
+        for ch in text:
+            cw = cell_width(ch)
+            if used + cw > limit:
+                break
+            out, used = out + ch, used + cw
+        try:
+            self.scr.addstr(y, x, out, attr)
+        except self.c.error:
+            pass  # writing the bottom-right cell raises; harmless
+        return x + used
+
+    def draw(self) -> None:
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 6 or w < 30:
+            self.put(0, 0, "barn: window too small")
+            scr.refresh()
+            return
+        # header
+        router = {None: "", True: " · router ●", False: " · router ○ (not running)"}[self.router_up]
+        self.put(0, 0, " herdr-barn", self.HUMAN)
+        self.put(0, 11, f" · {len(self.roster)} agents{router}", self.DIM)
+        hint = "Tab @complete · PgUp/PgDn · Esc close "
+        if w > 60:
+            self.put(0, w - text_width(hint), hint, self.DIM)
+        # roster strip
+        x = 1
+        for addr, agent in self.roster.items():
+            label = f"{STATE_GLYPH.get(agent.get('status'), '?')} {display_addr(addr, self.roster)}  "
+            if x + text_width(label) >= w:
+                self.put(1, x, "…", self.DIM)
+                break
+            x = self.put(1, x, label, self.agent_attr(addr))
+        # log
+        top, bottom = 2, h - 3
+        height = bottom - top + 1
+        rows = self.build_lines(w - 1)
+        max_scroll = max(0, len(rows) - height)
+        self.scroll = min(self.scroll, max_scroll)
+        start = max(0, len(rows) - height - self.scroll)
+        for i, row in enumerate(rows[start:start + height]):
+            x = 0
+            for chunk, attr in row:
+                x = self.put(top + i, x, chunk, attr)
+        if not rows:
+            self.put(top, 1, "The barn is quiet. Say something: @<box>/<pane> task…  or @all", self.DIM)
+        # status line
+        note = self.flash if time.time() < self.flash_until else ""
+        if self.scroll:
+            note = (note + "  " if note else "") + f"↑ scrolled {self.scroll} lines (PgDn)"
+        self.put(h - 2, 0, "─" * w, self.DIM)
+        if note:
+            self.put(h - 2, 2, f" {note} ", self.SYS)
+        # input
+        prompt = "> "
+        text = "".join(self.buf)
+        before = text[:self.cur]
+        avail = w - len(prompt) - 1
+        shift = max(0, text_width(before) - avail)
+        visible, skipped = "", 0
+        for ch in text:
+            if skipped < shift:
+                skipped += cell_width(ch)
+                continue
+            visible += ch
+        self.put(h - 1, 0, prompt, self.HUMAN)
+        self.put(h - 1, len(prompt), visible)
+        try:
+            scr.move(h - 1, min(w - 1, len(prompt) + text_width(before) - shift))
+        except self.c.error:
+            pass
+        scr.refresh()
+
+    # input ----------------------------------------------------------------
+    def say(self, message: str) -> None:
+        if message == "/who":
+            names = [f"@{a}" for a in self.roster] or ["(none)"]
+            self.flash_msg("agents: " + " ".join(names), 8)
+            return
+        append_jsonl(OUTBOX, {"id": new_id(), "ts": now_iso(), "from": HUMAN, "text": message})
+        self.history.append(message)
+        self.hist_i = len(self.history)
+        self.scroll = 0
+        self.flash_msg("sent" if self.router_up is not False else "queued; router is not running")
+
+    def flash_msg(self, text: str, secs: float = 3) -> None:
+        self.flash, self.flash_until = text, time.time() + secs
+
+    def complete(self) -> None:
+        text = "".join(self.buf)
+        head = text[:self.cur]
+        m = re.search(r"@([\w:./-]*)$", head)
+        if not m:
+            return
+        if self.comp and self.comp["end"] == self.cur and self.comp["options"]:
+            comp = self.comp
+            comp["i"] = (comp["i"] + 1) % len(comp["options"])
+        else:
+            prefix = m.group(1).lower()
+            options = [HUMAN] + list(self.roster) + sorted(
+                {a["name"] for a in self.roster.values() if a.get("name")}
+            ) + ["all"]
+            options = [o for o in options if o.lower().startswith(prefix)]
+            if not options:
+                self.flash_msg("no match")
+                return
+            comp = self.comp = {"start": m.start(), "options": options, "i": 0}
+        choice = "@" + comp["options"][comp["i"]] + " "
+        tail = text[self.cur:]
+        new_head = text[:comp["start"]] + choice
+        self.buf = list(new_head + tail)
+        self.cur = len(new_head)
+        comp["end"] = self.cur
+        if len(comp["options"]) > 1:
+            self.flash_msg(f"{comp['i'] + 1}/{len(comp['options'])} — Tab for next")
+
+    def key(self, ch) -> bool:
+        c = self.c
+        h, _ = self.scr.getmaxyx()
+        page = max(1, h - 6)
+        if ch not in ("\t", c.KEY_RESIZE):
+            self.comp = None
+        if isinstance(ch, str):
+            if ch in ("\n", "\r"):
+                message = "".join(self.buf).strip()
+                self.buf, self.cur = [], 0
+                if message:
+                    self.say(message)
+            elif ch == "\t":
+                self.complete()
+            elif ch == "\x1b":
+                if not self.buf:
+                    return False
+                self.buf, self.cur = [], 0
+            elif ch in ("\x03", "\x04"):
+                return False
+            elif ch in ("\x7f", "\x08"):
+                if self.cur:
+                    del self.buf[self.cur - 1]
+                    self.cur -= 1
+            elif ch == "\x15":
+                self.buf, self.cur = self.buf[self.cur:], 0
+            elif ch == "\x17":
+                i = self.cur
+                while i and self.buf[i - 1] == " ":
+                    i -= 1
+                while i and self.buf[i - 1] != " ":
+                    i -= 1
+                del self.buf[i:self.cur]
+                self.cur = i
+            elif ch == "\x01":
+                self.cur = 0
+            elif ch == "\x05":
+                self.cur = len(self.buf)
+            elif ch.isprintable():
+                self.buf.insert(self.cur, ch)
+                self.cur += 1
+            return True
+        if ch in (c.KEY_BACKSPACE,):
+            return self.key("\x7f")
+        if ch == c.KEY_DC and self.cur < len(self.buf):
+            del self.buf[self.cur]
+        elif ch == c.KEY_LEFT:
+            self.cur = max(0, self.cur - 1)
+        elif ch == c.KEY_RIGHT:
+            self.cur = min(len(self.buf), self.cur + 1)
+        elif ch == c.KEY_HOME:
+            self.cur = 0
+        elif ch == c.KEY_END:
+            self.cur = len(self.buf)
+        elif ch == c.KEY_UP and self.history:
+            self.hist_i = max(0, self.hist_i - 1)
+            self.buf = list(self.history[self.hist_i])
+            self.cur = len(self.buf)
+        elif ch == c.KEY_DOWN and self.history:
+            self.hist_i = min(len(self.history), self.hist_i + 1)
+            self.buf = list(self.history[self.hist_i]) if self.hist_i < len(self.history) else []
+            self.cur = len(self.buf)
+        elif ch == c.KEY_PPAGE:
+            self.scroll += page
+        elif ch == c.KEY_NPAGE:
+            self.scroll = max(0, self.scroll - page)
+        return True
+
+    def run(self) -> None:
+        dirty = True
+        while True:
+            self.check_router()
+            if self.poll():
+                dirty = True
+            if dirty or time.time() < self.flash_until + 0.3:
+                self.draw()
+                dirty = False
+            try:
+                ch = self.scr.get_wch()
+            except self.c.error:
+                continue
+            except KeyboardInterrupt:
+                return
+            if not self.key(ch):
+                return
+            dirty = True
+
+
+def cmd_ui(args) -> int:
+    import curses
+    import locale
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    os.makedirs(BARN_DIR, exist_ok=True)
+    if os.path.exists(HUB_MARKER) and not router_running():
+        spawn_router()
+    try:
+        curses.wrapper(lambda scr: UI(scr).run())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_open(args) -> int:
+    """Open the room from a key binding (the plugin's open-* actions)."""
+    base = [HERDR, "plugin", "pane", "open", "--plugin", "herdr-barn"]
+    if args.placement == "popup" and os.path.exists(HUB_MARKER):
+        cmd = base + ["--entrypoint", "room-popup"]
+    elif args.placement == "popup":
+        # herdr drops keystrokes to a popup on a machine you reach through a
+        # machine connection; an overlay is an ordinary pane, so typing works
+        cmd = base + ["--entrypoint", "room", "--placement", "overlay", "--focus"]
+    elif args.placement == "split":
+        cmd = base + ["--entrypoint", "room", "--placement", "split", "--direction", "right", "--focus"]
+    else:
+        cmd = base + ["--entrypoint", "room", "--placement", "tab", "--focus"]
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL).returncode
+
+
+# ──────────────────────────────────── main ──────────────────────────────────
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="barn", description="herdr-barn: a chat room for your agents")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("say", help="post a message (@human, @<box>/<pane>, @name, @all)")
+    p.add_argument("--human", action="store_true", help="post as @human even inside a pane")
+    p.add_argument("text", nargs="+", help='message text, or "-" to read stdin')
+    p.set_defaults(fn=cmd_say)
+    p = sub.add_parser("log", help="print recent history")
+    p.add_argument("-n", type=int, default=30)
+    p.set_defaults(fn=cmd_log)
+    sub.add_parser("who", help="list agents in the barn").set_defaults(fn=cmd_who)
+    sub.add_parser("ui", help="open the room").set_defaults(fn=cmd_ui)
+    p = sub.add_parser("open", help="open the room in herdr (used by the key bindings)")
+    p.add_argument("placement", choices=["popup", "split", "tab"])
+    p.set_defaults(fn=cmd_open)
+    p = sub.add_parser("router", help="deliver @mentions (hub only)")
+    p.add_argument("--daemon", action="store_true", help="start in the background if not running")
+    p.set_defaults(fn=cmd_router)
+    args = parser.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
