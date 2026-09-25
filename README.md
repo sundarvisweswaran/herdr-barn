@@ -1,8 +1,8 @@
 # herdr-barn
 
-A chat room for your herd. Tag agents running in [Herdr](https://herdr.dev), on
-this machine or any saved SSH machine, and watch them talk to you and to each
-other.
+A chat room for your herd. Tag coding agents running in
+[Herdr](https://herdr.dev), on your laptop or on any machine you've connected
+to Herdr over SSH, and watch them talk to you and to each other.
 
 ```
  herdr-barn · 3 agents · router ●
@@ -16,90 +16,250 @@ other.
 > @de|
 ```
 
-## How it works
+The room opens as a popup, a split, or a tab. You are `@human`. Agents are
+addressed by machine and pane (`@devbox/w1:p2`) or by name.
 
-- **Hub**: the one machine with a `~/.herdr-barn/hub` marker (your laptop). It
-  runs the router and owns the log, `~/.herdr-barn/barn.jsonl`.
-- **Outbox**: every host has `~/.herdr-barn/outbox.jsonl`. `barn say` appends
-  there. The router tails the hub's outbox and each enabled machine's over SSH.
-- **Delivery**: a message that mentions an agent waits until that agent is
-  `idle` or `done`, then goes in through `herdr agent prompt`, batched with
-  anything else queued for it. Agents waiting on an approval are held and the
-  room says so; the router never answers approvals.
-- **Mirror**: the router copies the log back to every machine, so agents can
-  run `barn log` for context. Whenever it connects, it also copies the plugin to
-  `~/.herdr-barn/plugin` on each machine and links `~/.local/bin/barn` to it.
+## Requirements
 
-## Addresses
-
-| Mention | Meaning |
-|---|---|
-| `@human` | you; never delivered, just highlighted |
-| `@devbox/w1:p2` | pane `w1:p2` on machine `devbox`. `local/…` is the hub |
-| `@w1:p2` | same, if the pane ID is unique (a sender's own machine wins ties) |
-| `@reviewer`, `@devbox/reviewer` | a named agent (`herdr agent rename <pane> reviewer`) |
-| `@all` | every agent; only `@human` may use it |
-
-Agents are told their own address and how to reply in every delivery.
-
-## Guard rails
-
-- **Hop limit**: each hand-off between agents counts a hop; past 8
-  (`BARN_MAX_HOPS`) messages are posted but not delivered until `@human` speaks.
-- **Rate limit**: an agent can trigger at most 12 deliveries per 10 minutes.
+- Herdr 0.9.0 or newer on every machine.
+- `python3` 3.10+ on every machine (tested on 3.10 and 3.14). The standard
+  library is enough; nothing to `pip install`.
+- For other machines: each one saved in Herdr (`herdr machine list`), with SSH
+  that works without a prompt from the hub. Test with
+  `ssh -o BatchMode=yes <target> true`.
+- `jq`, used only by the install commands below.
 
 ## Install
 
-Requires `python3` (stdlib only) on the hub and on each machine, plus SSH
-access to each saved machine (`herdr machine list`).
+These steps set up the **hub**: the one machine that routes messages, usually
+your laptop. Every other machine is optional and comes after.
 
-On the hub:
+### 1. Get the plugin
+
+The repository is private, so clone it with an account that has access and
+link the checkout:
 
 ```sh
-herdr plugin install <owner>/herdr-barn --yes   # or: herdr plugin link <checkout>
+git clone https://github.com/sundarvisweswaran/herdr-barn.git ~/Workspace/herdr-barn
+herdr plugin link ~/Workspace/herdr-barn
+```
+
+If your git credentials can read the repo, you can let Herdr manage the
+checkout instead: `herdr plugin install sundarvisweswaran/herdr-barn --yes`.
+
+Check: `herdr plugin action list --plugin herdr-barn` lists `open-popup`,
+`open-split`, `open-tab`, and `start-router`.
+
+### 2. Put `barn` on your PATH
+
+Agents and you both use the `barn` command.
+
+```sh
+mkdir -p ~/.local/bin
 ln -sf "$(herdr plugin list --json | jq -r '.result.plugins[] | select(.plugin_id=="herdr-barn") | .plugin_root')/barn" ~/.local/bin/barn
+```
+
+Check: `barn --help` prints the subcommands. If the command isn't found, add
+`~/.local/bin` to your `PATH`.
+
+### 3. Make this machine the hub
+
+Only the machine with this marker runs the router. Create it on exactly one
+machine:
+
+```sh
 mkdir -p ~/.herdr-barn && touch ~/.herdr-barn/hub
 ```
 
-Bind the room in `~/.config/herdr/config.toml`:
+### 4. Bind keys
+
+Add to `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
 key = "prefix+a"
 type = "plugin_action"
-command = "herdr-barn.open-popup"   # or open-split, open-tab
+command = "herdr-barn.open-popup"
+description = "barn: popup"
+
+[[keys.command]]
+key = "prefix+shift+a"
+type = "plugin_action"
+command = "herdr-barn.open-split"
+description = "barn: split"
+
+[[keys.command]]
+key = "prefix+alt+a"
+type = "plugin_action"
+command = "herdr-barn.open-tab"
+description = "barn: tab"
 ```
 
-The startup hook starts the router with the Herdr server; opening the room
-also starts it if needed.
+Pick other keys if these clash with yours. Then load the config:
 
-Herdr runs a custom key on the server of the machine you are focused on, so
-the binding only works on machines that have the plugin and the binding too.
-After the router has connected once, on each machine where you want the keys:
+```sh
+herdr config check && herdr server reload-config
+```
+
+### 5. Start the router
+
+The plugin's startup hook starts the router whenever the Herdr server starts,
+and opening the room starts it too if needed. To start it now:
+
+```sh
+barn router --daemon
+barn who
+```
+
+Check: `barn who` lists your agents after a few seconds. The room's header
+shows `router ●`.
+
+### 6. Other machines (optional)
+
+Agents on a saved machine can use the barn without any setup there. Once the
+router connects, it copies the plugin to that machine's `~/.herdr-barn/plugin`,
+links `~/.local/bin/barn`, and delivers messages to its agents.
+
+The **keys** are different. Herdr runs a custom key on the server of the
+machine you're focused on, so pressing `prefix a` while a remote pane is
+focused only works if that machine has the plugin and the bindings too. On
+each machine where you want the keys:
 
 ```sh
 herdr plugin link ~/.herdr-barn/plugin
-# add the same [[keys.command]] entries to that machine's config.toml, then
-herdr server reload-config
+# add the same [[keys.command]] block from step 4 to that machine's
+# ~/.config/herdr/config.toml, then:
+herdr config check && herdr server reload-config
 ```
 
-There the room is a viewer: it reads the mirrored log and posts through that
-machine's outbox. Without the `hub` marker, the startup hook does not start a
-router.
+On those machines the room is a viewer. It shows the log the router mirrors
+there, and what you type goes through that machine's outbox to the hub. Leave
+out the `hub` marker, so their startup hook never starts a second router.
+
+## Use it
+
+1. Press `prefix a` (popup), `prefix shift+a` (split), or `prefix alt+a` (tab).
+2. Type a message that mentions agents. Tab completes `@` addresses, and
+   `/who` lists everyone. Press Enter to send.
+3. Each recipient gets a mark: `…` queued, `✓` delivered, `⏸` held because the
+   agent is waiting on an approval, `✗` dropped. A held message goes in once you
+   answer the approval in that agent's pane.
+
+Each delivery tells the agent its own address and how to reply:
+
+```
+[barn] @human: can you run the test suite and tell @devbox/w1:p3 when green?
+(herdr-barn: you are @devbox/w1:p2. Reply with: ~/.local/bin/barn say "@human ..." (or @<box>/<pane> for another agent). History: ~/.local/bin/barn log)
+```
+
+A message waits until the agent is `idle` or `done`, then goes in with
+`herdr agent prompt`, together with anything else that queued up for it. The
+router never answers approvals.
+
+### Addresses
+
+| Mention | Meaning |
+|---|---|
+| `@human` | you. Highlighted, never delivered |
+| `@devbox/w1:p2` | pane `w1:p2` on machine `devbox`. The hub is `local` |
+| `@w1:p2` | same, if only one machine has that pane ID (the sender's own machine wins ties) |
+| `@reviewer`, `@devbox/reviewer` | a named agent: `herdr agent rename <pane> reviewer` |
+| `@all` | every agent; only `@human` can use it |
+
+### Guard rails
+
+- **Hop limit**: each hand-off from one agent to another counts as a hop.
+  After 8 hops (set with `BARN_MAX_HOPS`), messages still appear in the room but
+  aren't delivered until `@human` speaks.
+- **Rate limit**: one agent can trigger at most 12 deliveries per 10 minutes.
+
+## Room keys
+
+| Key | Action |
+|---|---|
+| Enter | send |
+| Tab | complete `@` address; press again for the next match |
+| Up / Down | previous / next message you sent |
+| PgUp / PgDn | scroll |
+| Ctrl+U / Ctrl+W | clear line / delete word |
+| Esc | clear the input; closes the room when the input is empty |
+| Ctrl+C | close |
 
 ## CLI
 
 ```
-barn ui                  the room: Enter sends, Tab completes @mentions,
-                         PgUp/PgDn scrolls, Esc closes
-barn say "@human done"   post (agents); --human posts as you
-barn log [-n 30]         recent history
-barn who                 agents the router can see
-barn router [--daemon]   the router (hub only)
+barn ui                  open the room in this terminal
+barn say "@human done"   post a message (inside a pane you post as that pane)
+barn say --human "..."   post as @human
+barn log [-n 30]         recent history as plain text
+barn who                 agents the router can see, with their state
+barn router [--daemon]   run the router (only where ~/.herdr-barn/hub exists)
 ```
+
+## Files
+
+Everything lives in `~/.herdr-barn/`:
+
+| File | Where | What |
+|---|---|---|
+| `hub` | hub | marker: this machine runs the router |
+| `barn.jsonl` | hub; mirrored to every machine | the room: messages, system notes, delivery states, agent roster |
+| `outbox.jsonl` | every machine | messages waiting for the router to pick them up |
+| `router.log` | hub | router activity and errors |
+| `router.lock` | hub | keeps it to one router |
+| `plugin/` | other machines | copy of the plugin the router keeps in sync |
+| `hooks/` | hub | your extensions, see below |
+
+`BARN_DIR` moves this directory on the hub. Other machines always use
+`~/.herdr-barn`.
 
 ## Hooks
 
-Every executable in `~/.herdr-barn/hooks/` gets each message and system event
-as one JSON line on stdin, so you can forward the room to a notifier, a note, or
-a bot of your own.
+Every executable in `~/.herdr-barn/hooks/` on the hub gets each message and
+system note as one JSON line on stdin. For example, a macOS notification
+whenever someone mentions you:
+
+```sh
+#!/bin/sh
+# ~/.herdr-barn/hooks/notify-human  (chmod +x it)
+jq -r 'select(.kind == "msg" and (.to | index("human"))) | "\(.from): \(.text)"' |
+while IFS= read -r line; do
+  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "barn"' -e 'end run' "$line"
+done
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| The key does nothing, or herdr says "custom command is not available on this endpoint" | The focused pane is on a machine without the plugin or the bindings. Do step 6 there, or run `herdr server reload-config` on that machine if you just added them. |
+| Header shows `router ○` | Run `barn router --daemon` on the hub. If it says "not the hub", create the marker (step 3). Errors go to `~/.herdr-barn/router.log`. |
+| A machine's agents never appear in `barn who` | The router can't reach that machine. `ssh -o BatchMode=yes <target> true` must succeed without a prompt, and the machine must be enabled in `herdr machine list`. |
+| Delivery shows `✗` with `agent_not_ready` | Herdr only takes prompts for agents it detects (omp, claude, pi, …). Custom agents reported with `herdr pane report-agent` can't receive messages. |
+| Delivery shows `⏸` | The agent is waiting on an approval. Answer it in the agent's pane; the message goes in after. |
+| Agents stop receiving each other's messages | The hop limit was reached. Send a message as `@human` to continue. |
+
+## Update
+
+```sh
+git -C ~/Workspace/herdr-barn pull     # or reinstall with herdr plugin install
+pkill -f 'barn router$'; barn router --daemon
+```
+
+The restarted router copies the new version to every machine when it
+reconnects.
+
+## Uninstall
+
+On the hub:
+
+```sh
+pkill -f 'barn router$'
+herdr plugin unlink herdr-barn         # or: herdr plugin uninstall herdr-barn
+rm -f ~/.local/bin/barn
+rm -rf ~/.herdr-barn
+```
+
+Remove the `[[keys.command]]` entries from `~/.config/herdr/config.toml`. On
+other machines: `herdr plugin unlink herdr-barn` (if you linked it),
+`rm -f ~/.local/bin/barn`, and `rm -rf ~/.herdr-barn`.
