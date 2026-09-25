@@ -136,6 +136,11 @@ On those machines the room is a viewer. It shows the log the router mirrors
 there, and what you type goes through that machine's outbox to the hub. Leave
 out the `hub` marker, so their startup hook never starts a second router.
 
+The popup key opens an **overlay** there instead of a popup: the room zoomed
+over your current pane, returning you to that pane when you close it. Herdr
+doesn't pass your keystrokes to a popup on a machine you reach through a
+machine connection, but an overlay is an ordinary pane, so typing works.
+
 ## Use it
 
 1. Press `prefix a` (popup), `prefix shift+a` (split), or `prefix alt+a` (tab).

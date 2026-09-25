@@ -1080,6 +1080,22 @@ def cmd_ui(args) -> int:
     return 0
 
 
+def cmd_open(args) -> int:
+    """Open the room from a key binding (the plugin's open-* actions)."""
+    base = [HERDR, "plugin", "pane", "open", "--plugin", "herdr-barn"]
+    if args.placement == "popup" and os.path.exists(HUB_MARKER):
+        cmd = base + ["--entrypoint", "room-popup"]
+    elif args.placement == "popup":
+        # herdr drops keystrokes to a popup on a machine you reach through a
+        # machine connection; an overlay is an ordinary pane, so typing works
+        cmd = base + ["--entrypoint", "room", "--placement", "overlay", "--focus"]
+    elif args.placement == "split":
+        cmd = base + ["--entrypoint", "room", "--placement", "split", "--direction", "right", "--focus"]
+    else:
+        cmd = base + ["--entrypoint", "room", "--placement", "tab", "--focus"]
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL).returncode
+
+
 # ──────────────────────────────────── main ──────────────────────────────────
 
 
@@ -1095,6 +1111,9 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_log)
     sub.add_parser("who", help="list agents in the barn").set_defaults(fn=cmd_who)
     sub.add_parser("ui", help="open the room").set_defaults(fn=cmd_ui)
+    p = sub.add_parser("open", help="open the room in herdr (used by the key bindings)")
+    p.add_argument("placement", choices=["popup", "split", "tab"])
+    p.set_defaults(fn=cmd_open)
     p = sub.add_parser("router", help="deliver @mentions (hub only)")
     p.add_argument("--daemon", action="store_true", help="start in the background if not running")
     p.set_defaults(fn=cmd_router)

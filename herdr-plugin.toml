@@ -27,20 +27,20 @@ command = ["python3", "barn", "ui"]
 [[actions]]
 id = "open-popup"
 title = "Barn: open popup"
-description = "Open the barn as a popup over the current layout."
-command = ["sh", "-c", 'exec "$HERDR_BIN_PATH" plugin pane open --plugin herdr-barn --entrypoint room-popup']
+description = "Open the barn as a popup (an overlay on machines other than the hub)."
+command = ["python3", "barn", "open", "popup"]
 
 [[actions]]
 id = "open-split"
 title = "Barn: open in split"
 description = "Open the barn in a split beside the current pane."
-command = ["sh", "-c", 'exec "$HERDR_BIN_PATH" plugin pane open --plugin herdr-barn --entrypoint room --placement split --direction right --focus']
+command = ["python3", "barn", "open", "split"]
 
 [[actions]]
 id = "open-tab"
 title = "Barn: open in tab"
 description = "Open the barn in its own tab."
-command = ["sh", "-c", 'exec "$HERDR_BIN_PATH" plugin pane open --plugin herdr-barn --entrypoint room --placement tab --focus']
+command = ["python3", "barn", "open", "tab"]
 
 [[actions]]
 id = "start-router"
