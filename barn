@@ -10,8 +10,9 @@
 The hub keeps the log in ~/.herdr-barn/barn.jsonl. Every host (hub and boxes)
 has ~/.herdr-barn/outbox.jsonl: `barn say` appends there, the router tails each
 outbox over SSH, and mirrors the log back so `barn log` works on the boxes.
-Messages to an agent wait until it is idle/done, then go in through
-`herdr agent prompt`. The human is @human; agents are @<box>/<pane-id> or a
+Messages to an agent go in right away through `herdr agent prompt`, mid-turn if
+it is working; only an agent waiting on an approval holds them. The human is
+@human; agents are @<box>/<pane-id> or a
 herdr agent name.
 
 Extending: every executable in ~/.herdr-barn/hooks/ receives each message and
@@ -60,6 +61,7 @@ MAX_HOPS = int(os.environ.get("BARN_MAX_HOPS", "8"))
 RATE_N, RATE_WINDOW = 12, 600  # agent-originated deliveries per sender
 KEEP_LINES = 3000
 REMOTE_BIN = "~/.local/bin/barn"
+PEERS_SHOWN = 12  # agents listed in each delivery; `barn who` has the rest
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
@@ -145,6 +147,14 @@ def display_addr(addr: str, roster: dict) -> str:
     if agent and agent.get("name"):
         return f"{agent['name']}@{agent['box']}"
     return addr
+
+
+def mention(addr: str, roster: dict) -> str:
+    """How an agent sees an address: the @mention that reaches it, plus its name."""
+    if addr == HUMAN:
+        return "@human"
+    name = (roster.get(addr) or {}).get("name")
+    return f"@{addr} ({name})" if name else f"@{addr}"
 
 
 # ───────────────────────────── say / log / who ──────────────────────────────
@@ -393,10 +403,17 @@ class Worker(threading.Thread):
 
     def compose(self, batch: list) -> str:
         roster = self.router.roster_by_addr()
-        lines = [f"[barn] {display_addr(m['from'], roster)}: {m['text']}" for m in batch]
+        lines = [f"[barn] {mention(m['from'], roster)}: {m['text']}" for m in batch]
+        senders = list(dict.fromkeys("@" + m["from"] for m in batch))
+        peers = [mention(addr, roster) for addr in roster if addr != self.addr]
+        if len(peers) > PEERS_SHOWN:
+            peers = peers[:PEERS_SHOWN] + [f"{len(peers) - PEERS_SHOWN} more"]
         lines.append(
-            f"(herdr-barn: you are @{self.addr}. Reply with: {REMOTE_BIN} say \"@human ...\""
-            f" (or @<box>/<pane> for another agent). History: {REMOTE_BIN} log)"
+            f"(herdr-barn: a chat room shared by @human and other agents; you are @{self.addr}."
+            f" Reply to {' and '.join(senders)} with: {REMOTE_BIN} say \"{senders[0]} ...\"."
+            " Mention any agent to talk to it directly"
+            + (f"; here now: {', '.join(peers)}" if peers else "")
+            + f". Everyone: {REMOTE_BIN} who. History: {REMOTE_BIN} log)"
         )
         return "\n".join(lines)
 
@@ -429,11 +446,8 @@ class Worker(threading.Thread):
                 time.sleep(4)
                 continue
             blocked_since = None
-            if status == "working":
-                box = self.router.boxes[self.box_label]
-                box.herdr("agent", "wait", self.pane, "--until", "idle", "--until", "done",
-                          "--until", "blocked", "--timeout", "300000", timeout=310)
-                continue
+            # a working agent gets the message mid-turn: agent TUIs take a prompt
+            # submitted while busy as a steer and read it at their next step
             box = self.router.boxes[self.box_label]
             proc = box.herdr("agent", "prompt", self.pane, self.compose(batch), timeout=60)
             if proc.returncode == 0:

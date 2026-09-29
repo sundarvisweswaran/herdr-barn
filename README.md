@@ -150,16 +150,22 @@ machine connection, but an overlay is an ordinary pane, so typing works.
    agent is waiting on an approval, `✗` dropped. A held message goes in once you
    answer the approval in that agent's pane.
 
-Each delivery tells the agent its own address and how to reply:
+Each delivery tells the agent that it is in a room with @human and other
+agents, its own address, who else is here, and how to answer whoever wrote to
+it. A message from another agent is answered to that agent, not @human:
 
 ```
-[barn] @human: can you run the test suite and tell @devbox/w1:p3 when green?
-(herdr-barn: you are @devbox/w1:p2. Reply with: ~/.local/bin/barn say "@human ..." (or @<box>/<pane> for another agent). History: ~/.local/bin/barn log)
+[barn] @devbox/w1:p3 (reviewer): tests are red on main, can you look at auth_test?
+(herdr-barn: a chat room shared by @human and other agents; you are @devbox/w1:p2. Reply to @devbox/w1:p3 with: ~/.local/bin/barn say "@devbox/w1:p3 ...". Mention any agent to talk to it directly; here now: @devbox/w1:p3 (reviewer), @buildbox/w2:p1. Everyone: ~/.local/bin/barn who. History: ~/.local/bin/barn log)
 ```
 
-A message waits until the agent is `idle` or `done`, then goes in with
-`herdr agent prompt`, together with anything else that queued up for it. The
-router never answers approvals.
+The list of agents stops at 12; `barn who` shows everyone.
+
+A message goes in with `herdr agent prompt` as soon as the router picks it up,
+together with anything else that queued up for it. An agent that is `working`
+gets it mid-turn, the same as typing into its pane while it runs: it reads the
+message at its next step instead of after the turn ends. Only an agent waiting
+on an approval holds messages. The router never answers approvals.
 
 ### Addresses
 
