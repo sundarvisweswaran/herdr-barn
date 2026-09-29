@@ -1,0 +1,49 @@
+id = "herdr-barn"
+name = "herdr-barn"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "A chat room for your herd: @mention agents on any machine and watch them talk"
+platforms = ["linux", "macos"]
+
+# The hub (where this plugin is installed) runs the router. The hook only
+# starts it in the background and exits; `barn router` keeps one instance.
+[[startup]]
+command = ["python3", "barn", "router", "--daemon"]
+
+[[panes]]
+id = "room"
+title = "Barn"
+placement = "split"
+command = ["python3", "barn", "ui"]
+
+[[panes]]
+id = "room-popup"
+title = "Barn"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["python3", "barn", "ui"]
+
+[[actions]]
+id = "open-popup"
+title = "Barn: open popup"
+description = "Open the barn as a popup (an overlay on machines other than the hub)."
+command = ["python3", "barn", "open", "popup"]
+
+[[actions]]
+id = "open-split"
+title = "Barn: open in split"
+description = "Open the barn in a split beside the current pane."
+command = ["python3", "barn", "open", "split"]
+
+[[actions]]
+id = "open-tab"
+title = "Barn: open in tab"
+description = "Open the barn in its own tab."
+command = ["python3", "barn", "open", "tab"]
+
+[[actions]]
+id = "start-router"
+title = "Barn: start router"
+description = "Start the message router if it is not running."
+command = ["python3", "barn", "router", "--daemon"]
